@@ -397,5 +397,18 @@ https://github.com/mensenvau/stratascratch_sql_solutions/tree/main
 https://github.com/MartaCasdelg/StrataScratch-SQL-Challenges/tree/main
 
 https://github.com/mensenvau/stratascratch_sql_solutions/tree/main
+https://github.com/MoonsukJi93/StrataScratch
+
+https://github.com/KaneZhao/StrataScratch
+
+https://github.com/VaasuDevanS/python-notebooks
+
+https://github.com/UmaTheDataScientist/Stratascratch-Solutions
+
+https://github.com/linnelab/stratascratch_daily
+
+https://github.com/jarvisye01/leetcode_algorithm/tree/master
+
+https://github.com/alessandrofd/leetcode-python
 
 
