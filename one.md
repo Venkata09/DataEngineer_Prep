@@ -393,3 +393,9 @@ https://github.com/caibirdme/leetforfun/tree/master
 https://github.com/jarvisye01/leetcode_algorithm/tree/master
 
 https://github.com/mensenvau/stratascratch_sql_solutions/tree/main
+
+https://github.com/MartaCasdelg/StrataScratch-SQL-Challenges/tree/main
+
+https://github.com/mensenvau/stratascratch_sql_solutions/tree/main
+
+
