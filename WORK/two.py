@@ -19,60 +19,59 @@ from .connections import ConnectionManager  # type: ignore
 SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast"}
 SNAPSHOT_TZ = os.environ.get("SNAPSHOT_TZ", "America/New_York")
 
-
-# ── Engine (uses your ConnectionManager) ──────────────────────────────────────
+# ── Engine using your ConnectionManager (no DSN, no pool) ────────────────────
 def _dbapi_creator():
     cm = ConnectionManager()
-    # support either get_connection() or connect()
     if hasattr(cm, "get_connection"):
         return cm.get_connection()
     if hasattr(cm, "connect"):
         return cm.connect()
-    return cm()  # if your manager is callable
+    return cm()  # if callable
 
-# No pooling in Cloud Functions; one connection per use.
 engine = sa.create_engine(
-    "postgresql+pg8000://",  # compatible with AlloyDB connector returning pg8000 connection
+    "postgresql+pg8000://",   # use pg8000; add it to requirements.txt
     creator=_dbapi_creator,
     poolclass=NullPool,
     future=True,
 )
 
-# ── Table metadata (no create_all; DB already has the DDL) ────────────────────
-meta = sa.MetaData(schema="nms")
-
-runs = sa.Table(
-    "table_metrics_runs", meta,
-    sa.Column("run_id", sa.BigInteger, primary_key=True),
-    sa.Column("collected_at", sa.TIMESTAMP(timezone=True)),   # DEFAULT now() in DB
-    sa.Column("snapshot_date", sa.Date),                      # DEFAULT biz-date in DB
-    sa.Column("status", sa.Text, nullable=False),
-    sa.Column("error_message", sa.Text),
-    sa.Column("skip_schemas", JSONB, nullable=False),
-    sa.Column("exclude_tables", JSONB, nullable=False),
+# ── Lightweight table/column definitions (no MetaData/reflect) ───────────────
+runs = sa.table(
+    "table_metrics_runs",
+    sa.column("run_id", sa.BigInteger, primary_key=True),
+    sa.column("collected_at", sa.TIMESTAMP(timezone=True)),
+    sa.column("snapshot_date", sa.Date),
+    sa.column("status", sa.Text),
+    sa.column("error_message", sa.Text),
+    sa.column("skip_schemas", JSONB),
+    sa.column("exclude_tables", JSONB),
+    schema="nms",
 )
 
-meas = sa.Table(
-    "table_metrics_measurements", meta,
-    sa.Column("run_id", sa.BigInteger, nullable=False),
-    sa.Column("schema_name", sa.Text, nullable=False),
-    sa.Column("table_name", sa.Text, nullable=False),
-    sa.Column("row_count", sa.BigInteger, nullable=False),
+meas = sa.table(
+    "table_metrics_measurements",
+    sa.column("run_id", sa.BigInteger),
+    sa.column("schema_name", sa.Text),
+    sa.column("table_name", sa.Text),
+    sa.column("row_count", sa.BigInteger),
+    schema="nms",
 )
 
-run_snap = sa.Table(
-    "table_metrics_run_snapshot", meta,
-    sa.Column("run_id", sa.BigInteger, primary_key=True),
-    sa.Column("payload", JSONB, nullable=False),
-    sa.Column("collected_at", sa.TIMESTAMP(timezone=True)),
+run_snap = sa.table(
+    "table_metrics_run_snapshot",
+    sa.column("run_id", sa.BigInteger, primary_key=True),
+    sa.column("payload", JSONB),
+    sa.column("collected_at", sa.TIMESTAMP(timezone=True)),
+    schema="nms",
 )
 
-day_snap = sa.Table(
-    "table_metrics_daily_snapshot", meta,
-    sa.Column("snapshot_date", sa.Date, primary_key=True),
-    sa.Column("run_id", sa.BigInteger),
-    sa.Column("payload", JSONB, nullable=False),
-    sa.Column("collected_at", sa.TIMESTAMP(timezone=True)),
+day_snap = sa.table(
+    "table_metrics_daily_snapshot",
+    sa.column("snapshot_date", sa.Date, primary_key=True),
+    sa.column("run_id", sa.BigInteger),
+    sa.column("payload", JSONB),
+    sa.column("collected_at", sa.TIMESTAMP(timezone=True)),
+    schema="nms",
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -119,7 +118,7 @@ def _count_exact(conn: sa.Connection, schema: str, table: str) -> int:
     res = conn.execute(sa.text(f"SELECT COUNT(*) FROM {fq}"))
     return int(res.scalar_one())
 
-# ── Core write ops using PostgreSQL dialect upserts ───────────────────────────
+# ── Core write ops (all SQLAlchemy Core; Postgres upserts where needed) ───────
 def _insert_run_header(conn: sa.Connection, status: str,
                        skip_schemas: List[str], exclude_tables: List[str]) -> int:
     stmt = sa.insert(runs).values(
@@ -131,16 +130,13 @@ def _insert_run_header(conn: sa.Connection, status: str,
 
 def _update_run_status(conn: sa.Connection, run_id: int, status: str, error_message: Optional[str]):
     stmt = sa.update(runs).where(runs.c.run_id == run_id).values(
-        status=status,
-        error_message=error_message
+        status=status, error_message=error_message
     )
     conn.execute(stmt)
 
 def _insert_measurements(conn: sa.Connection, rows: List[Tuple[int, str, str, int]]) -> None:
-    payload = [
-        {"run_id": rid, "schema_name": s, "table_name": t, "row_count": cnt}
-        for (rid, s, t, cnt) in rows
-    ]
+    payload = [{"run_id": rid, "schema_name": s, "table_name": t, "row_count": cnt}
+               for (rid, s, t, cnt) in rows]
     if payload:
         conn.execute(sa.insert(meas), payload)
 
@@ -173,7 +169,7 @@ def _write_daily_snapshot(conn: sa.Connection, run_id: int, snapshot_date: datet
 # ── CloudEvent entrypoint ─────────────────────────────────────────────────────
 def main(cloud_event: CloudEvent):
     """
-    CloudEvent payload (inverse):
+    CloudEvent JSON payload (inverse):
       {"exclude":["schema.table", ...], "skipSchemas":["tmp","stage"]}
     """
     body = _parse_event_body(cloud_event)
@@ -184,21 +180,20 @@ def main(cloud_event: CloudEvent):
         exclude_tables, skip_schemas = _validate_request(body)
         exclude_pairs = {tuple(fq.split(".", 1)) for fq in exclude_tables}
 
-        # 1) create a RUNNING header in its own transaction (so it persists even if later work fails)
+        # 1) create a RUNNING header (own tx so it persists even if later work fails)
         with engine.begin() as conn:
             run_id = _insert_run_header(conn, status="RUNNING",
                                         skip_schemas=skip_schemas,
                                         exclude_tables=exclude_tables)
 
-        # 2) do the work in a new transaction
+        # 2) do the work
         with engine.begin() as conn:
-            # discover & filter
             all_targets = _list_all_tables(conn, set(SYSTEM_SCHEMAS) | set(skip_schemas))
             targets = [(s, t) for (s, t) in all_targets if (s, t) not in exclude_pairs]
             if not targets:
                 raise ValueError("no tables to process after applying exclusions")
 
-            # count & build structures
+            # count → measurements + nested JSON
             measurements: List[Tuple[int, str, str, int]] = []
             payload: Dict[str, Dict[str, int]] = {}
             for (schema, table) in targets:
@@ -206,12 +201,10 @@ def main(cloud_event: CloudEvent):
                 measurements.append((run_id, schema, table, cnt))
                 payload.setdefault(schema, {})[table] = cnt
 
-            # write detail + snapshots
+            # write detail + snapshots; mark success
             _insert_measurements(conn, measurements)
             _write_run_snapshot(conn, run_id, payload)
             _write_daily_snapshot(conn, run_id, business_date, payload)
-
-            # mark success
             _update_run_status(conn, run_id, "SUCCEEDED", None)
 
         return {
@@ -223,7 +216,16 @@ def main(cloud_event: CloudEvent):
 
     except Exception as e:
         logging.exception("table metrics job failed")
-        # try to mark FAILED if we did create a header
+        # try to mark FAILED if header exists; otherwise create FAILED for audit
         try:
             if run_id is not None:
-                with engine.begi
+                with engine.begin() as conn:
+                    _update_run_status(conn, run_id, "FAILED", str(e)[:4000])
+            else:
+                with engine.begin() as conn:
+                    _ = _insert_run_header(conn, status="FAILED",
+                                           skip_schemas=body.get("skipSchemas", []) if isinstance(body, dict) else [],
+                                           exclude_tables=body.get("exclude", []) if isinstance(body, dict) else [])
+        except Exception:
+            pass
+        return {"status": "error", "message": str(e)}
