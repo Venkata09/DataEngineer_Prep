@@ -296,3 +296,277 @@ def main(cloud_event: CloudEvent):
 Make it a **package** (add `__init__.py`). That’s the “correct way” for Python projects and makes Cloud Functions import it cleanly. If you’re worried about name collisions, consider a more specific package name like `metrics_util` or `nms_util`.
 
 If you want, I can zip this structure into a minimal sample repo layout you can drop into your project.
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------
+
+
+
+Good catch — that warning is about **SQL injection via string-built SQL**. The only place we were doing that was the `COUNT(*)` call that interpolated `schema.table` into a `text()` string.
+
+Below is a **drop-in fix** that avoids text SQL entirely for dynamic identifiers and uses **SQLAlchemy Core constructs** (which handle quoting safely). I’m also including an optional identifier whitelist if your static analyzer wants it.
+
+---
+
+# ✅ Replace `util/discovery.py`
+
+```python
+# util/discovery.py
+import re
+import sqlalchemy as sa
+
+SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast"}
+
+# Optional: strict identifier whitelist (adjust if you use mixed case or spaces)
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def _is_safe_ident(name: str) -> bool:
+    # If you have exotic names (mixed case/quotes), you can return True
+    # and rely purely on SQLAlchemy quoting. Keeping the regex helps many linters.
+    return bool(_IDENT_RE.match(name))
+
+def _quoted_table(schema: str, table: str) -> sa.Table:
+    """
+    Build a SQLAlchemy Table object for COUNT(*), with safe quoting of identifiers.
+    No reflection needed; no raw SQL string interpolation.
+    """
+    if not (_is_safe_ident(schema) and _is_safe_ident(table)):
+        # If you truly allow exotic names, you can remove the check above.
+        # Using quoted_name forces quoting regardless of content.
+        schema = sa.sql.quoted_name(schema, True)
+        table  = sa.sql.quoted_name(table,  True)
+
+    # No columns required just to COUNT(*)
+    return sa.Table(table, sa.MetaData(), schema=schema)
+
+def list_all_tables(conn: sa.Connection, exclude_schemas: set):
+    """
+    Returns [(schema, table), ...] from information_schema.
+    No untrusted interpolation in the SQL.
+    """
+    rows = conn.execute(sa.text("""
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+    """)).all()
+    return [(s, t) for (s, t) in rows if s not in exclude_schemas]
+
+def count_exact(conn: sa.Connection, schema: str, table: str) -> int:
+    """
+    Exact COUNT(*) using Core:
+      SELECT count(*) FROM "schema"."table"
+    Safe for dynamic identifiers without building SQL strings.
+    """
+    tbl = _quoted_table(schema, table)
+    stmt = sa.select(sa.func.count()).select_from(tbl)
+    return int(conn.execute(stmt).scalar_one())
+```
+
+### Why this silences the warning
+
+* We **don’t** build `SELECT COUNT(*) FROM {schema}.{table}` strings.
+* We let SQLAlchemy **compile and quote** identifiers correctly (safe even if names require quoting).
+* Optional `_IDENT_RE` check keeps static analyzers happy; if your org has only simple identifiers, keep it. If you do have exotic names, leave the `quoted_name` fallback (still safe).
+
+---
+
+# dml.py — nothing to change
+
+Your DML helpers already use **parameterized Core** and PostgreSQL **`insert(..).on_conflict_do_update`**. There’s no string interpolation there, so they’re safe.
+
+(If you previously had any `exec_driver_sql("... %s ...", params)`, replace those with Core expressions too.)
+
+---
+
+# main.py — no interface changes
+
+You don’t have to change your main flow; it still calls:
+
+```python
+all_targets = list_all_tables(conn, set(SYSTEM_SCHEMAS) | set(skip_schemas))
+cnt = count_exact(conn, schema, table)
+```
+
+Everything else (bulk insert, upserts, single-transaction commit) stays the same.
+
+---
+
+## Quick sanity test
+
+```python
+with ENGINE.begin() as conn:
+    # Should print a reasonable count and not trigger the analyzer.
+    print(count_exact(conn, "public", "orders"))
+```
+
+If you want me to run through any other lines the scanner flagged, paste the exact snippets and I’ll refactor them into safe Core constructs as well.
+
+
+
+Great callout. The warnings are about **SQL injection** risk; the fix is to avoid any raw SQL strings and rely on **SQLAlchemy Core** with **bound parameters**. Your `dml.py` can stay 100% safe by:
+
+* Using `sa.insert/sa.update` (no `text()` or string concatenation)
+* Using **PostgreSQL upserts** and referencing **`EXCLUDED`** values (no `sa.literal(...)`)
+* Passing Python dicts as parameter sets (driver binds them safely)
+
+Here’s a **drop-in, safer `dml.py`** that should silence those scanner findings.
+
+```python
+# util/dml.py
+from typing import Dict, List, Tuple, Optional
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# All functions accept SQLAlchemy Core "table" objects built in util/tables.py
+# and a SQLAlchemy Connection (within a transaction, e.g., with engine.begin()).
+
+def insert_run_header(
+    conn: sa.Connection,
+    runs,
+    *,
+    status: str,
+    skip_schemas: List[str],
+    exclude_tables: List[str],
+) -> int:
+    """
+    INSERT into runs and return run_id.
+    Uses bound parameters (safe); DB fills collected_at/snapshot_date via defaults.
+    """
+    stmt = sa.insert(runs).values(
+        status=status,
+        skip_schemas=skip_schemas,
+        exclude_tables=exclude_tables,
+    ).returning(runs.c.run_id)
+
+    run_id = conn.execute(stmt).scalar_one()
+    return int(run_id)
+
+
+def update_run_status(
+    conn: sa.Connection,
+    runs,
+    run_id: int,
+    status: str,
+    error_message: Optional[str],
+) -> None:
+    """
+    UPDATE runs status/error_message using bound parameters.
+    """
+    stmt = (
+        sa.update(runs)
+        .where(runs.c.run_id == sa.bindparam("p_run_id"))
+        .values(status=sa.bindparam("p_status"), error_message=sa.bindparam("p_err"))
+    )
+    conn.execute(stmt, {"p_run_id": run_id, "p_status": status, "p_err": error_message})
+
+
+def insert_measurements(
+    conn: sa.Connection,
+    metrics,
+    rows: List[Tuple[int, str, str, int]],
+) -> None:
+    """
+    Bulk insert per-table counts:
+      rows = [(run_id, schema_name, table_name, row_count), ...]
+    Emits a single INSERT ... VALUES (...), (...), ... with bound params.
+    """
+    if not rows:
+        return
+
+    rows_to_insert = [
+        {"run_id": rid, "schema_name": s, "table_name": t, "row_count": cnt}
+        for (rid, s, t, cnt) in rows
+    ]
+
+    stmt = sa.insert(metrics).values(rows_to_insert)
+    conn.execute(stmt)
+
+
+def write_run_snapshot(
+    conn: sa.Connection,
+    run_snap,
+    run_id: int,
+    payload_nested: Dict[str, Dict[str, int]],
+) -> None:
+    """
+    Upsert per-run JSON snapshot using EXCLUDED values (no literals).
+    """
+    stmt = pg_insert(run_snap).values(
+        run_id=run_id,
+        payload=payload_nested,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[run_snap.c.run_id],
+        set_={
+            "payload": stmt.excluded.payload,
+            "collected_at": sa.func.now(),
+        },
+    )
+    conn.execute(stmt)
+
+
+def write_daily_snapshot(
+    conn: sa.Connection,
+    day_snap,
+    run_id: int,
+    snapshot_date,  # date
+    payload_nested: Dict[str, Dict[str, int]],
+) -> None:
+    """
+    Upsert one JSON row per business day:
+      - Insert (date, run_id, payload) if not present
+      - On conflict, overwrite ONLY if incoming EXCLUDED.run_id is newer
+    All comparisons/assignments use EXCLUDED and bound params (no literals).
+    """
+    stmt = pg_insert(day_snap).values(
+        snapshot_date=snapshot_date,
+        run_id=run_id,
+        payload=payload_nested,
+    )
+
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[day_snap.c.snapshot_date],
+        set_={
+            "run_id": stmt.excluded.run_id,
+            "payload": stmt.excluded.payload,
+            "collected_at": sa.func.now(),
+        },
+        where=sa.or_(
+            day_snap.c.run_id.is_(None),
+            stmt.excluded.run_id > day_snap.c.run_id,
+        ),
+    )
+
+    conn.execute(stmt)
+```
+
+### Why this addresses the scanner warnings
+
+* **No raw SQL strings** or identifier interpolation.
+* **No `exec_driver_sql(...)`**; everything is Core with bound params.
+* The **“newer wins”** logic for the daily snapshot uses `EXCLUDED.run_id` and `EXCLUDED.payload` directly—no `sa.literal(...)`, so linters won’t flag “inlined” values.
+* Bulk inserts for measurements use a list of dicts → **parameterized executemany/multi-VALUES**.
+
+### Usage reminder (commit)
+
+Wrap your call site in a single transaction so writes are committed:
+
+```python
+with ENGINE.begin() as conn:
+    run_id = insert_run_header(conn, T.runs, status="RUNNING",
+                               skip_schemas=skip_schemas, exclude_tables=exclude_tables)
+    # ... counts ...
+    insert_measurements(conn, T.metrics, measurements)
+    write_run_snapshot(conn, T.run_snap, run_id, payload)
+    write_daily_snapshot(conn, T.day_snap, run_id, business_date, payload)
+    update_run_status(conn, T.runs, run_id, "SUCCEEDED", None)
+```
+
+If your static analyzer flags anything else, paste the exact line and I’ll refactor it into Core constructs as well.
+
+
+
