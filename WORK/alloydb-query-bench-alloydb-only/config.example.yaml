@@ -1,0 +1,32 @@
+
+run:
+  repeats: 5
+  warmups: 2
+  statement_timeout_ms: 60000
+  default_session:
+    # work_mem: "64MB"
+    # enable_nestloop: "on"
+
+queries:
+  - name: inline_demo
+    sql: |
+      SELECT generate_series(1, :n) AS n
+    params:
+      n: 100000
+
+  - name: sample_count
+    file: queries/count_sample.sql
+
+  - name: top_series
+    sql: |
+      WITH t AS (
+        SELECT md5(random()::text) AS k
+        FROM generate_series(1, 50000)
+      )
+      SELECT k, count(*) 
+      FROM t
+      GROUP BY 1
+      ORDER BY 2 DESC
+      LIMIT :limit
+    params:
+      limit: 10
